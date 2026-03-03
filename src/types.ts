@@ -3,6 +3,7 @@ export interface User {
   name: string;
   avatar: string;
   status: string;
+  phoneNumber?: string;
   lastSeen?: string;
   isOnline?: boolean;
   isAI?: boolean;

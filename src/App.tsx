@@ -15,9 +15,11 @@ import {
   User as UserIcon,
   Settings,
   CircleDashed,
-  LogOut
+  LogOut,
+  Trash2,
+  ChevronLeft
 } from 'lucide-react';
-import { format } from 'date-fns';
+import { format, formatDistanceToNow } from 'date-fns';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { motion, AnimatePresence } from 'motion/react';
@@ -35,23 +37,21 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+  const [remoteTyping, setRemoteTyping] = useState<string | null>(null);
+  const [loginStep, setLoginStep] = useState<'phone' | 'otp' | 'complete'>('phone');
+  const [phoneNumber, setPhoneNumber] = useState('');
+  const [otp, setOtp] = useState('');
   const socketRef = useRef<Socket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Initialize user
+  // Initialize user from localStorage
   useEffect(() => {
     const savedUser = localStorage.getItem('wa_user');
     if (savedUser) {
       setCurrentUser(JSON.parse(savedUser));
-    } else {
-      const newUser: User = {
-        id: Math.random().toString(36).substring(7),
-        name: 'You',
-        avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${Math.random()}`,
-        status: 'Hey there! I am using WhatsApp.',
-      };
-      setCurrentUser(newUser);
-      localStorage.setItem('wa_user', JSON.stringify(newUser));
+      setLoginStep('complete');
     }
   }, []);
 
@@ -79,10 +79,15 @@ export default function App() {
         setMessages(prev => [...prev, message]);
       }
       
-      // Update last message in chat list
       setChats(prev => prev.map(c => 
         c.id === message.chatId ? { ...c, lastMessage: message } : c
       ));
+    });
+
+    socketRef.current.on('user-typing', (data: { userId: string, isTyping: boolean }) => {
+      if (activeChat?.participants.some(p => p.id === data.userId)) {
+        setRemoteTyping(data.isTyping ? data.userId : null);
+      }
     });
 
     return () => {
@@ -106,6 +111,45 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (loginStep === 'phone') {
+      // Simulate sending OTP
+      setLoginStep('otp');
+    } else if (loginStep === 'otp') {
+      // Simulate OTP verification
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phoneNumber,
+          name: `User ${phoneNumber.slice(-4)}`,
+          avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${phoneNumber}`,
+        }),
+      });
+      const user = await res.json();
+      setCurrentUser(user);
+      localStorage.setItem('wa_user', JSON.stringify(user));
+      setLoginStep('complete');
+    }
+  };
+
+  const handleTyping = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setInputText(e.target.value);
+    
+    if (!isTyping && activeChat) {
+      setIsTyping(true);
+      socketRef.current?.emit('typing', { chatId: activeChat.id, userId: currentUser?.id, isTyping: true });
+    }
+
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    
+    typingTimeoutRef.current = setTimeout(() => {
+      setIsTyping(false);
+      socketRef.current?.emit('typing', { chatId: activeChat.id, userId: currentUser?.id, isTyping: false });
+    }, 2000);
+  };
+
   const handleSendMessage = (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!inputText.trim() || !activeChat || !currentUser) return;
@@ -123,6 +167,13 @@ export default function App() {
 
     socketRef.current?.emit('send-message', { ...newMessage, recipientId });
     setInputText('');
+    setIsTyping(false);
+    socketRef.current?.emit('typing', { chatId: activeChat.id, userId: currentUser?.id, isTyping: false });
+  };
+
+  const deleteMessage = async (messageId: string) => {
+    await fetch(`/api/messages/${messageId}`, { method: 'DELETE' });
+    setMessages(prev => prev.filter(m => m.id !== messageId));
   };
 
   const startChat = (otherUser: User) => {
@@ -141,11 +192,60 @@ export default function App() {
       setChats(prev => [newChat, ...prev]);
       setActiveChat(newChat);
     }
+    setSearchQuery('');
   };
 
-  const filteredUsers = users.filter(u => 
-    u.name.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  if (loginStep !== 'complete') {
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-[#f0f2f5]">
+        <div className="w-[450px] bg-white p-10 rounded-lg shadow-lg text-center">
+          <img 
+            src="https://upload.wikimedia.org/wikipedia/commons/6/6b/WhatsApp.svg" 
+            alt="WhatsApp" 
+            className="w-20 mx-auto mb-8"
+          />
+          <h1 className="text-2xl font-light text-[#41525d] mb-6">
+            {loginStep === 'phone' ? 'Enter your phone number' : 'Enter the OTP'}
+          </h1>
+          <form onSubmit={handleLogin} className="space-y-6">
+            {loginStep === 'phone' ? (
+              <input 
+                type="tel" 
+                placeholder="+1 234 567 890" 
+                className="w-full border-b-2 border-[#00a884] py-2 outline-none text-xl text-center"
+                value={phoneNumber}
+                onChange={(e) => setPhoneNumber(e.target.value)}
+                required
+              />
+            ) : (
+              <input 
+                type="text" 
+                placeholder="123456" 
+                className="w-full border-b-2 border-[#00a884] py-2 outline-none text-xl text-center tracking-widest"
+                value={otp}
+                onChange={(e) => setOtp(e.target.value)}
+                required
+              />
+            )}
+            <button 
+              type="submit"
+              className="w-full bg-[#00a884] text-white py-3 rounded-md font-medium hover:bg-[#008f6f] transition-colors"
+            >
+              {loginStep === 'phone' ? 'NEXT' : 'VERIFY'}
+            </button>
+          </form>
+          {loginStep === 'otp' && (
+            <button 
+              onClick={() => setLoginStep('phone')}
+              className="mt-4 text-[#00a884] text-sm font-medium"
+            >
+              Change Phone Number
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen w-full bg-[#f0f2f5] overflow-hidden font-sans">
@@ -184,7 +284,7 @@ export default function App() {
               <div className="px-4 py-3 text-[#008069] text-sm font-medium uppercase tracking-wider">
                 Contacts
               </div>
-              {filteredUsers.map(user => (
+              {users.filter(u => u.name.toLowerCase().includes(searchQuery.toLowerCase())).map(user => (
                 <div 
                   key={user.id}
                   onClick={() => startChat(user)}
@@ -224,11 +324,6 @@ export default function App() {
                     <div className="text-sm text-[#667781] truncate max-w-[200px]">
                       {chat.lastMessage?.text || "No messages yet"}
                     </div>
-                    {chat.unreadCount > 0 && (
-                      <div className="bg-[#25d366] text-white text-[10px] font-bold rounded-full w-5 h-5 flex items-center justify-center">
-                        {chat.unreadCount}
-                      </div>
-                    )}
                   </div>
                 </div>
               </div>
@@ -249,7 +344,13 @@ export default function App() {
                 </div>
                 <div>
                   <div className="font-medium text-[#111b21]">{activeChat.participants[0].name}</div>
-                  <div className="text-xs text-[#667781]">online</div>
+                  <div className="text-xs text-[#667781]">
+                    {remoteTyping === activeChat.participants[0].id ? (
+                      <span className="text-[#00a884] font-medium">typing...</span>
+                    ) : (
+                      activeChat.participants[0].lastSeen ? `last seen ${formatDistanceToNow(new Date(activeChat.participants[0].lastSeen))} ago` : 'online'
+                    )}
+                  </div>
                 </div>
               </div>
               <div className="flex items-center gap-6 text-[#54656f]">
@@ -294,6 +395,12 @@ export default function App() {
                             <CheckCheck className="w-4 h-4 text-[#53bdeb]" />
                           )}
                         </div>
+                        <button 
+                          onClick={() => deleteMessage(msg.id)}
+                          className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity text-gray-400 hover:text-red-500"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       </div>
                     </motion.div>
                   );
@@ -317,7 +424,7 @@ export default function App() {
                   placeholder="Type a message" 
                   className="w-full bg-white rounded-lg px-4 py-2.5 outline-none text-sm"
                   value={inputText}
-                  onChange={(e) => setInputText(e.target.value)}
+                  onChange={handleTyping}
                 />
               </div>
               <div className="text-[#54656f]">
