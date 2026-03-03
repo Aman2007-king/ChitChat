@@ -37,7 +37,8 @@ db.exec(`
     status TEXT,
     phoneNumber TEXT,
     lastSeen TEXT,
-    isAI INTEGER DEFAULT 0
+    isAI INTEGER DEFAULT 0,
+    personality TEXT
   );
 
   CREATE TABLE IF NOT EXISTS messages (
@@ -52,7 +53,10 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS chats (
     id TEXT PRIMARY KEY,
+    name TEXT,
+    avatar TEXT,
     participants TEXT,
+    isGroup INTEGER DEFAULT 0,
     unreadCount INTEGER DEFAULT 0
   );
 `);
@@ -60,9 +64,9 @@ db.exec(`
 // Seed AI users if not exist
 const seedAI = db.prepare("SELECT COUNT(*) as count FROM users WHERE isAI = 1").get() as { count: number };
 if (seedAI.count === 0) {
-  const insertUser = db.prepare("INSERT INTO users (id, name, avatar, status, isAI) VALUES (?, ?, ?, ?, ?)");
-  insertUser.run("ai-1", "Gemini AI", "https://picsum.photos/seed/gemini/200", "Always here to chat!", 1);
-  insertUser.run("ai-2", "Tech Support", "https://picsum.photos/seed/support/200", "How can I help you today?", 1);
+  const insertUser = db.prepare("INSERT INTO users (id, name, avatar, status, isAI, personality) VALUES (?, ?, ?, ?, ?, ?)");
+  insertUser.run("ai-1", "Gemini AI", "https://picsum.photos/seed/gemini/200", "Always here to chat!", 1, "A helpful and friendly assistant.");
+  insertUser.run("ai-2", "Tech Support", "https://picsum.photos/seed/support/200", "How can I help you today?", 1, "A technical expert who is direct and efficient.");
 }
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -82,6 +86,22 @@ async function startServer() {
   app.get("/api/users", (req, res) => {
     const users = db.prepare("SELECT * FROM users").all();
     res.json(users);
+  });
+
+  app.post("/api/users/:userId", async (req, res) => {
+    const { userId } = req.params;
+    const { status, personality, name, avatar } = req.body;
+    
+    db.prepare("UPDATE users SET status = COALESCE(?, status), personality = COALESCE(?, personality), name = COALESCE(?, name), avatar = COALESCE(?, avatar) WHERE id = ?")
+      .run(status, personality, name, avatar, userId);
+    
+    const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
+    
+    if (firestore) {
+      await firestore.collection("users").doc(userId).set(updatedUser, { merge: true });
+    }
+    
+    res.json(updatedUser);
   });
 
   app.post("/api/login", async (req, res) => {
@@ -112,14 +132,28 @@ async function startServer() {
     const chatsWithDetails = chats.map((chat: any) => {
       const participants = JSON.parse(chat.participants);
       if (participants.includes(userId)) {
-        const otherUserId = participants.find((id: string) => id !== userId);
-        const otherUser = db.prepare("SELECT * FROM users WHERE id = ?").get(otherUserId);
-        const lastMessage = db.prepare("SELECT * FROM messages WHERE chatId = ? AND deletedForUser = 0 ORDER BY timestamp DESC LIMIT 1").get(chat.id);
-        return { ...chat, participants: [otherUser], lastMessage };
+        if (chat.isGroup) {
+          const lastMessage = db.prepare("SELECT * FROM messages WHERE chatId = ? AND deletedForUser = 0 ORDER BY timestamp DESC LIMIT 1").get(chat.id);
+          return { ...chat, participants: [], lastMessage }; // Participants handled differently for groups
+        } else {
+          const otherUserId = participants.find((id: string) => id !== userId);
+          const otherUser = db.prepare("SELECT * FROM users WHERE id = ?").get(otherUserId);
+          const lastMessage = db.prepare("SELECT * FROM messages WHERE chatId = ? AND deletedForUser = 0 ORDER BY timestamp DESC LIMIT 1").get(chat.id);
+          return { ...chat, participants: [otherUser], lastMessage };
+        }
       }
       return null;
     }).filter(Boolean);
     res.json(chatsWithDetails);
+  });
+
+  app.post("/api/chats", (req, res) => {
+    const { name, avatar, participants, isGroup } = req.body;
+    const id = Math.random().toString(36).substring(7);
+    db.prepare("INSERT INTO chats (id, name, avatar, participants, isGroup) VALUES (?, ?, ?, ?, ?)")
+      .run(id, name, avatar, JSON.stringify(participants), isGroup ? 1 : 0);
+    const newChat = db.prepare("SELECT * FROM chats WHERE id = ?").get(id);
+    res.json(newChat);
   });
 
   app.get("/api/messages/:chatId", (req, res) => {
@@ -170,7 +204,9 @@ async function startServer() {
         try {
           const response = await ai.models.generateContent({
             model: "gemini-3-flash-preview",
-            contents: `You are ${recipient.name}, a helpful contact on WhatsApp. Respond to this message: "${text}"`,
+            contents: `You are ${recipient.name}, a helpful contact on WhatsApp. 
+            Your personality is: ${recipient.personality || "A helpful assistant"}.
+            Respond to this message: "${text}"`,
           });
 
           const aiMessage = {

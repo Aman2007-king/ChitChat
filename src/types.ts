@@ -7,6 +7,7 @@ export interface User {
   lastSeen?: string;
   isOnline?: boolean;
   isAI?: boolean;
+  personality?: string;
 }
 
 export interface Message {
@@ -20,7 +21,10 @@ export interface Message {
 
 export interface Chat {
   id: string;
+  name?: string;
+  avatar?: string;
   participants: User[];
+  isGroup?: boolean;
   lastMessage?: Message;
   unreadCount: number;
 }
