@@ -1,0 +1,55 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique user ID" },
+        "name": { "type": "string", "description": "User's display name" },
+        "avatar": { "type": "string", "description": "URL to user's profile picture" },
+        "status": { "type": "string", "description": "User's status message" },
+        "phoneNumber": { "type": "string", "description": "User's phone number (optional)" },
+        "lastSeen": { "type": "string", "format": "date-time", "description": "Last time the user was online" },
+        "isAI": { "type": "boolean", "description": "Whether the user is an AI contact" },
+        "personality": { "type": "string", "description": "AI personality traits" },
+        "privacy": {
+          "type": "object",
+          "properties": {
+            "lastSeen": { "type": "string", "enum": ["everyone", "contacts", "nobody"] },
+            "status": { "type": "string", "enum": ["everyone", "contacts", "nobody"] },
+            "profilePhoto": { "type": "string", "enum": ["everyone", "contacts", "nobody"] }
+          }
+        }
+      },
+      "required": ["id", "name", "avatar"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "A chat message",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique message ID" },
+        "chatId": { "type": "string", "description": "ID of the chat this message belongs to" },
+        "senderId": { "type": "string", "description": "ID of the user who sent the message" },
+        "text": { "type": "string", "description": "Text content of the message" },
+        "audioUrl": { "type": "string", "description": "URL to audio file if message is a voice note" },
+        "type": { "type": "string", "enum": ["text", "audio"], "description": "Type of message" },
+        "timestamp": { "type": "string", "format": "date-time", "description": "Time the message was sent" },
+        "status": { "type": "string", "enum": ["sent", "delivered", "read"], "description": "Message status" },
+        "reactions": { "type": "object", "description": "Emoji reactions to the message" }
+      },
+      "required": ["id", "chatId", "senderId", "type", "timestamp", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile collection"
+    },
+    "/chats/{chatId}/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Messages within a chat"
+    }
+  }
+}

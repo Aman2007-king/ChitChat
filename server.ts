@@ -38,7 +38,8 @@ db.exec(`
     phoneNumber TEXT,
     lastSeen TEXT,
     isAI INTEGER DEFAULT 0,
-    personality TEXT
+    personality TEXT,
+    privacy TEXT -- JSON string
   );
 
   CREATE TABLE IF NOT EXISTS messages (
@@ -46,9 +47,12 @@ db.exec(`
     chatId TEXT,
     senderId TEXT,
     text TEXT,
+    audioUrl TEXT,
+    type TEXT DEFAULT 'text',
     timestamp TEXT,
     status TEXT,
-    deletedForUser INTEGER DEFAULT 0
+    deletedForUser INTEGER DEFAULT 0,
+    reactions TEXT -- JSON string
   );
 
   CREATE TABLE IF NOT EXISTS chats (
@@ -84,18 +88,25 @@ async function startServer() {
 
   // API Routes
   app.get("/api/users", (req, res) => {
-    const users = db.prepare("SELECT * FROM users").all();
-    res.json(users);
+    const users = db.prepare("SELECT * FROM users").all() as any[];
+    const parsedUsers = users.map(u => ({
+      ...u,
+      privacy: u.privacy ? JSON.parse(u.privacy) : { lastSeen: 'everyone', status: 'everyone', profilePhoto: 'everyone' }
+    }));
+    res.json(parsedUsers);
   });
 
   app.post("/api/users/:userId", async (req, res) => {
     const { userId } = req.params;
-    const { status, personality, name, avatar } = req.body;
+    const { status, personality, name, avatar, privacy } = req.body;
     
-    db.prepare("UPDATE users SET status = COALESCE(?, status), personality = COALESCE(?, personality), name = COALESCE(?, name), avatar = COALESCE(?, avatar) WHERE id = ?")
-      .run(status, personality, name, avatar, userId);
+    db.prepare("UPDATE users SET status = COALESCE(?, status), personality = COALESCE(?, personality), name = COALESCE(?, name), avatar = COALESCE(?, avatar), privacy = COALESCE(?, privacy) WHERE id = ?")
+      .run(status, personality, name, avatar, privacy ? JSON.stringify(privacy) : null, userId);
     
-    const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
+    const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
+    if (updatedUser) {
+      updatedUser.privacy = updatedUser.privacy ? JSON.parse(updatedUser.privacy) : { lastSeen: 'everyone', status: 'everyone', profilePhoto: 'everyone' };
+    }
     
     if (firestore) {
       await firestore.collection("users").doc(userId).set(updatedUser, { merge: true });
@@ -105,14 +116,17 @@ async function startServer() {
   });
 
   app.post("/api/login", async (req, res) => {
-    const { phoneNumber, name, avatar } = req.body;
-    let user = db.prepare("SELECT * FROM users WHERE phoneNumber = ?").get(phoneNumber) as any;
+    const { id, name, avatar, email } = req.body;
+    let user = db.prepare("SELECT * FROM users WHERE id = ?").get(id) as any;
     
     if (!user) {
-      const id = Math.random().toString(36).substring(7);
       db.prepare("INSERT INTO users (id, name, avatar, status, phoneNumber, lastSeen, isAI) VALUES (?, ?, ?, ?, ?, ?, ?)")
-        .run(id, name, avatar, "Hey there! I am using WhatsApp.", phoneNumber, new Date().toISOString(), 0);
-      user = db.prepare("SELECT * FROM users WHERE id = ?").get(id);
+        .run(id, name, avatar, "Hey there! I am using WhatsApp.", email || null, new Date().toISOString(), 0);
+      user = db.prepare("SELECT * FROM users WHERE id = ?").get(id) as any;
+    }
+
+    if (user) {
+      user.privacy = user.privacy ? JSON.parse(user.privacy) : { lastSeen: 'everyone', status: 'everyone', profilePhoto: 'everyone' };
     }
 
     // Sync to Firebase if available
@@ -128,17 +142,26 @@ async function startServer() {
 
   app.get("/api/chats/:userId", (req, res) => {
     const { userId } = req.params;
-    const chats = db.prepare("SELECT * FROM chats").all();
+    const chats = db.prepare("SELECT * FROM chats").all() as any[];
     const chatsWithDetails = chats.map((chat: any) => {
       const participants = JSON.parse(chat.participants);
       if (participants.includes(userId)) {
         if (chat.isGroup) {
-          const lastMessage = db.prepare("SELECT * FROM messages WHERE chatId = ? AND deletedForUser = 0 ORDER BY timestamp DESC LIMIT 1").get(chat.id);
+          const lastMessage = db.prepare("SELECT * FROM messages WHERE chatId = ? AND deletedForUser = 0 ORDER BY timestamp DESC LIMIT 1").get(chat.id) as any;
+          if (lastMessage) {
+            lastMessage.reactions = lastMessage.reactions ? JSON.parse(lastMessage.reactions) : {};
+          }
           return { ...chat, participants: [], lastMessage }; // Participants handled differently for groups
         } else {
           const otherUserId = participants.find((id: string) => id !== userId);
-          const otherUser = db.prepare("SELECT * FROM users WHERE id = ?").get(otherUserId);
-          const lastMessage = db.prepare("SELECT * FROM messages WHERE chatId = ? AND deletedForUser = 0 ORDER BY timestamp DESC LIMIT 1").get(chat.id);
+          const otherUser = db.prepare("SELECT * FROM users WHERE id = ?").get(otherUserId) as any;
+          if (otherUser) {
+            otherUser.privacy = otherUser.privacy ? JSON.parse(otherUser.privacy) : { lastSeen: 'everyone', status: 'everyone', profilePhoto: 'everyone' };
+          }
+          const lastMessage = db.prepare("SELECT * FROM messages WHERE chatId = ? AND deletedForUser = 0 ORDER BY timestamp DESC LIMIT 1").get(chat.id) as any;
+          if (lastMessage) {
+            lastMessage.reactions = lastMessage.reactions ? JSON.parse(lastMessage.reactions) : {};
+          }
           return { ...chat, participants: [otherUser], lastMessage };
         }
       }
@@ -158,8 +181,12 @@ async function startServer() {
 
   app.get("/api/messages/:chatId", (req, res) => {
     const { chatId } = req.params;
-    const messages = db.prepare("SELECT * FROM messages WHERE chatId = ? AND deletedForUser = 0 ORDER BY timestamp ASC").all(chatId);
-    res.json(messages);
+    const messages = db.prepare("SELECT * FROM messages WHERE chatId = ? AND deletedForUser = 0 ORDER BY timestamp ASC").all(chatId) as any[];
+    const parsedMessages = messages.map(m => ({
+      ...m,
+      reactions: m.reactions ? JSON.parse(m.reactions) : {}
+    }));
+    res.json(parsedMessages);
   });
 
   app.delete("/api/messages/:messageId", async (req, res) => {
@@ -181,11 +208,11 @@ async function startServer() {
     });
 
     socket.on("send-message", async (data) => {
-      const { id, chatId, senderId, text, timestamp, status, recipientId } = data;
+      const { id, chatId, senderId, text, audioUrl, type, timestamp, status, recipientId } = data;
       
       // Save to local DB
-      db.prepare("INSERT INTO messages (id, chatId, senderId, text, timestamp, status) VALUES (?, ?, ?, ?, ?, ?)")
-        .run(id, chatId, senderId, text, timestamp, status);
+      db.prepare("INSERT INTO messages (id, chatId, senderId, text, audioUrl, type, timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(id, chatId, senderId, text || null, audioUrl || null, type || 'text', timestamp, status);
 
       // Sync to Firebase if available
       if (firestore) {
@@ -200,7 +227,7 @@ async function startServer() {
 
       // AI Response logic
       const recipient = db.prepare("SELECT * FROM users WHERE id = ?").get(recipientId) as any;
-      if (recipient && recipient.isAI) {
+      if (recipient && recipient.isAI && type === 'text') {
         try {
           const response = await ai.models.generateContent({
             model: "gemini-3-flash-preview",
@@ -214,12 +241,13 @@ async function startServer() {
             chatId,
             senderId: recipientId,
             text: response.text || "I'm not sure how to respond to that.",
+            type: 'text',
             timestamp: new Date().toISOString(),
             status: "sent",
           };
 
-          db.prepare("INSERT INTO messages (id, chatId, senderId, text, timestamp, status) VALUES (?, ?, ?, ?, ?, ?)")
-            .run(aiMessage.id, aiMessage.chatId, aiMessage.senderId, aiMessage.text, aiMessage.timestamp, aiMessage.status);
+          db.prepare("INSERT INTO messages (id, chatId, senderId, text, type, timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .run(aiMessage.id, aiMessage.chatId, aiMessage.senderId, aiMessage.text, aiMessage.type, aiMessage.timestamp, aiMessage.status);
 
           if (firestore) {
             await firestore.collection("chats").doc(chatId).collection("messages").doc(aiMessage.id).set({
@@ -233,6 +261,43 @@ async function startServer() {
           console.error("AI Error:", error);
         }
       }
+    });
+
+    socket.on("update-message-status", (data) => {
+      const { messageId, chatId, status } = data;
+      db.prepare("UPDATE messages SET status = ? WHERE id = ?").run(status, messageId);
+      socket.to(chatId).emit("message-status-updated", { messageId, status });
+    });
+
+    socket.on("react-to-message", (data) => {
+      const { messageId, chatId, userId, emoji } = data;
+      const message = db.prepare("SELECT reactions FROM messages WHERE id = ?").get(messageId) as any;
+      let reactions = message.reactions ? JSON.parse(message.reactions) : {};
+      
+      // Remove user's previous reaction if any
+      for (const e in reactions) {
+        reactions[e] = reactions[e].filter((id: string) => id !== userId);
+        if (reactions[e].length === 0) delete reactions[e];
+      }
+      
+      // Add new reaction
+      if (emoji) {
+        if (!reactions[emoji]) reactions[emoji] = [];
+        reactions[emoji].push(userId);
+      }
+      
+      db.prepare("UPDATE messages SET reactions = ? WHERE id = ?").run(JSON.stringify(reactions), messageId);
+      io.to(chatId).emit("message-reaction-updated", { messageId, reactions });
+    });
+
+    socket.on("initiate-call", (data) => {
+      const { to, from, type } = data;
+      socket.to(to).emit("incoming-call", { from, type });
+    });
+
+    socket.on("end-call", (data) => {
+      const { to } = data;
+      socket.to(to).emit("call-ended");
     });
 
     socket.on("update-status", (data) => {

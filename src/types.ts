@@ -8,15 +8,23 @@ export interface User {
   isOnline?: boolean;
   isAI?: boolean;
   personality?: string;
+  privacy?: {
+    lastSeen: 'everyone' | 'contacts' | 'nobody';
+    status: 'everyone' | 'contacts' | 'nobody';
+    profilePhoto: 'everyone' | 'contacts' | 'nobody';
+  };
 }
 
 export interface Message {
   id: string;
   chatId: string;
   senderId: string;
-  text: string;
+  text?: string;
+  audioUrl?: string;
+  type: 'text' | 'audio';
   timestamp: string;
   status: 'sent' | 'delivered' | 'read';
+  reactions?: { [emoji: string]: string[] }; // emoji -> list of userIds
 }
 
 export interface Chat {

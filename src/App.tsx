@@ -9,6 +9,7 @@ import {
   Paperclip, 
   Smile, 
   Mic, 
+  MicOff,
   Send,
   Check,
   CheckCheck,
@@ -25,13 +26,23 @@ import {
   Moon,
   Sun,
   Users,
-  Plus
+  Plus,
+  Minus,
+  Play,
+  Pause,
+  Volume2,
+  PhoneIncoming,
+  PhoneOutgoing,
+  VideoOff
 } from 'lucide-react';
 import { format, formatDistanceToNow } from 'date-fns';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { motion, AnimatePresence } from 'motion/react';
+import Cropper from 'react-easy-crop';
 import { User, Message, Chat } from './types';
+import { auth, googleProvider } from './firebase';
+import { signInWithPopup, onAuthStateChanged, signOut } from 'firebase/auth';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -47,28 +58,60 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [remoteTyping, setRemoteTyping] = useState<string | null>(null);
-  const [loginStep, setLoginStep] = useState<'phone' | 'otp' | 'complete'>('phone');
-  const [phoneNumber, setPhoneNumber] = useState('');
-  const [otp, setOtp] = useState('');
+  const [loginStep, setLoginStep] = useState<'login' | 'complete'>('login');
   const [showProfile, setShowProfile] = useState<User | null>(null);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
   const [editValue, setEditValue] = useState('');
-  const [editType, setEditType] = useState<'status' | 'personality' | 'name' | null>(null);
+  const [editType, setEditType] = useState<'status' | 'personality' | 'name' | 'avatar' | null>(null);
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [showNewGroup, setShowNewGroup] = useState(false);
   const [groupName, setGroupName] = useState('');
   const [selectedContacts, setSelectedContacts] = useState<string[]>([]);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const [activeCall, setActiveCall] = useState<{ user: User, type: 'voice' | 'video', status: 'calling' | 'ongoing' | 'ended', startTime?: number } | null>(null);
+  const [isMuted, setIsMuted] = useState(false);
+  const [isSpeakerOn, setIsSpeakerOn] = useState(false);
+  const [callTimer, setCallTimer] = useState(0);
+  const [chatSearchQuery, setChatSearchQuery] = useState('');
+  const [showChatSearch, setShowChatSearch] = useState(false);
+  const [showReactionsFor, setShowReactionsFor] = useState<string | null>(null);
+  
+  // Cropper state
+  const [imageToCrop, setImageToCrop] = useState<string | null>(null);
+  const [crop, setCrop] = useState({ x: 0, y: 0 });
+  const [zoom, setZoom] = useState(1);
+  const [croppedAreaPixels, setCroppedAreaPixels] = useState<any>(null);
+
   const socketRef = useRef<Socket | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Initialize user and theme from localStorage
   useEffect(() => {
-    const savedUser = localStorage.getItem('wa_user');
-    if (savedUser) {
-      setCurrentUser(JSON.parse(savedUser));
-      setLoginStep('complete');
-    }
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: user.uid,
+            name: user.displayName,
+            avatar: user.photoURL,
+            email: user.email,
+          }),
+        });
+        const userData = await res.json();
+        setCurrentUser(userData);
+        setLoginStep('complete');
+      } else {
+        setCurrentUser(null);
+        setLoginStep('login');
+      }
+    });
 
     const savedTheme = localStorage.getItem('wa_theme');
     if (savedTheme === 'dark') {
@@ -137,6 +180,22 @@ export default function App() {
       }
     });
 
+    socketRef.current.on('message-status-updated', (data: { messageId: string, status: 'sent' | 'delivered' | 'read' }) => {
+      setMessages(prev => prev.map(m => m.id === data.messageId ? { ...m, status: data.status } : m));
+    });
+
+    socketRef.current.on('incoming-call', (data: { from: User, type: 'voice' | 'video' }) => {
+      setActiveCall({ user: data.from, type: data.type, status: 'calling' });
+    });
+
+    socketRef.current.on('call-ended', () => {
+      setActiveCall(null);
+    });
+
+    socketRef.current.on('message-reaction-updated', (data: { messageId: string, reactions: { [emoji: string]: string[] } }) => {
+      setMessages(prev => prev.map(m => m.id === data.messageId ? { ...m, reactions: data.reactions } : m));
+    });
+
     return () => {
       socketRef.current?.disconnect();
     };
@@ -158,26 +217,121 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (loginStep === 'phone') {
-      // Simulate sending OTP
-      setLoginStep('otp');
-    } else if (loginStep === 'otp') {
-      // Simulate OTP verification
-      const res = await fetch('/api/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          phoneNumber,
-          name: `User ${phoneNumber.slice(-4)}`,
-          avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${phoneNumber}`,
-        }),
+  // Mark messages as read when active chat changes or new messages arrive
+  useEffect(() => {
+    if (!activeChat || !currentUser || !socketRef.current) return;
+
+    const unreadMessages = messages.filter(m => m.senderId !== currentUser.id && m.status !== 'read');
+    unreadMessages.forEach(m => {
+      socketRef.current?.emit('update-message-status', { messageId: m.id, chatId: activeChat.id, status: 'read' });
+    });
+  }, [activeChat, messages, currentUser]);
+
+  // Call timer
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (activeCall?.status === 'ongoing') {
+      interval = setInterval(() => {
+        setCallTimer(prev => prev + 1);
+      }, 1000);
+    } else {
+      setCallTimer(0);
+    }
+    return () => clearInterval(interval);
+  }, [activeCall?.status]);
+
+  const updatePrivacySetting = async (key: 'lastSeen' | 'status' | 'profilePhoto', value: string) => {
+    if (!currentUser) return;
+    const newPrivacy = {
+      ...currentUser.privacy,
+      [key]: value
+    };
+    
+    const res = await fetch(`/api/users/${currentUser.id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ privacy: newPrivacy }),
+    });
+    
+    const updatedUser = await res.json();
+    setCurrentUser(updatedUser);
+    localStorage.setItem('wa_user', JSON.stringify(updatedUser));
+  };
+
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (error) {
+      console.error("Login failed:", error);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      localStorage.removeItem('wa_user');
+      setCurrentUser(null);
+      setLoginStep('login');
+    } catch (error) {
+      console.error("Logout failed:", error);
+    }
+  };
+
+  const onCropComplete = (_croppedArea: any, croppedAreaPixels: any) => {
+    setCroppedAreaPixels(croppedAreaPixels);
+  };
+
+  const createImage = (url: string): Promise<HTMLImageElement> =>
+    new Promise((resolve, reject) => {
+      const image = new Image();
+      image.addEventListener('load', () => resolve(image));
+      image.addEventListener('error', (error) => reject(error));
+      image.setAttribute('crossOrigin', 'anonymous');
+      image.src = url;
+    });
+
+  const getCroppedImg = async (imageSrc: string, pixelCrop: any): Promise<string> => {
+    const image = await createImage(imageSrc);
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+
+    if (!ctx) return '';
+
+    canvas.width = pixelCrop.width;
+    canvas.height = pixelCrop.height;
+
+    ctx.drawImage(
+      image,
+      pixelCrop.x,
+      pixelCrop.y,
+      pixelCrop.width,
+      pixelCrop.height,
+      0,
+      0,
+      pixelCrop.width,
+      pixelCrop.height
+    );
+
+    return canvas.toDataURL('image/jpeg');
+  };
+
+  const handleApplyCrop = async () => {
+    if (imageToCrop && croppedAreaPixels) {
+      const croppedImage = await getCroppedImg(imageToCrop, croppedAreaPixels);
+      if (currentUser) {
+        await updateUserProfile(currentUser.id, { avatar: croppedImage });
+      }
+      setImageToCrop(null);
+    }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      const reader = new FileReader();
+      reader.addEventListener('load', () => {
+        setImageToCrop(reader.result as string);
       });
-      const user = await res.json();
-      setCurrentUser(user);
-      localStorage.setItem('wa_user', JSON.stringify(user));
-      setLoginStep('complete');
+      reader.readAsDataURL(e.target.files[0]);
     }
   };
 
@@ -197,6 +351,98 @@ export default function App() {
     }, 2000);
   };
 
+  // Recording timer
+  useEffect(() => {
+    if (isRecording) {
+      recordingIntervalRef.current = setInterval(() => {
+        setRecordingTime(prev => prev + 1);
+      }, 1000);
+    } else {
+      if (recordingIntervalRef.current) clearInterval(recordingIntervalRef.current);
+      setRecordingTime(0);
+    }
+    return () => {
+      if (recordingIntervalRef.current) clearInterval(recordingIntervalRef.current);
+    };
+  }, [isRecording]);
+
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const reader = new FileReader();
+        reader.readAsDataURL(audioBlob);
+        reader.onloadend = () => {
+          const base64Audio = reader.result as string;
+          sendAudioMessage(base64Audio);
+        };
+        stream.getTracks().forEach(track => track.stop());
+      };
+
+      mediaRecorder.start();
+      setIsRecording(true);
+    } catch (err) {
+      console.error("Error accessing microphone:", err);
+      alert("Please allow microphone access to record voice messages.");
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+    }
+  };
+
+  const cancelRecording = () => {
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.onstop = null; // Prevent sending
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+      audioChunksRef.current = [];
+    }
+  };
+
+  const sendAudioMessage = (audioUrl: string) => {
+    if (!activeChat || !currentUser) return;
+
+    const newMessage: Message = {
+      id: Math.random().toString(36).substring(7),
+      chatId: activeChat.id,
+      senderId: currentUser.id,
+      audioUrl,
+      type: 'audio',
+      timestamp: new Date().toISOString(),
+      status: 'sent',
+    };
+
+    const recipientId = activeChat.participants[0].id;
+    socketRef.current?.emit('send-message', { ...newMessage, recipientId });
+  };
+
+  const initiateCall = (type: 'voice' | 'video') => {
+    if (!activeChat || activeChat.isGroup) return;
+    const recipient = activeChat.participants[0];
+    setActiveCall({ user: recipient, type, status: 'calling' });
+    socketRef.current?.emit('initiate-call', { to: recipient.id, from: currentUser, type });
+  };
+
+  const endCall = () => {
+    if (activeCall) {
+      socketRef.current?.emit('end-call', { to: activeCall.user.id });
+      setActiveCall(null);
+    }
+  };
+
   const handleSendMessage = (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!inputText.trim() || !activeChat || !currentUser) return;
@@ -206,6 +452,7 @@ export default function App() {
       chatId: activeChat.id,
       senderId: currentUser.id,
       text: inputText,
+      type: 'text',
       timestamp: new Date().toISOString(),
       status: 'sent',
     };
@@ -295,43 +542,15 @@ export default function App() {
             className="w-20 mx-auto mb-8"
           />
           <h1 className="text-2xl font-light text-[#41525d] mb-6">
-            {loginStep === 'phone' ? 'Enter your phone number' : 'Enter the OTP'}
+            Welcome to WhatsApp
           </h1>
-          <form onSubmit={handleLogin} className="space-y-6">
-            {loginStep === 'phone' ? (
-              <input 
-                type="tel" 
-                placeholder="+1 234 567 890" 
-                className="w-full border-b-2 border-[#00a884] py-2 outline-none text-xl text-center"
-                value={phoneNumber}
-                onChange={(e) => setPhoneNumber(e.target.value)}
-                required
-              />
-            ) : (
-              <input 
-                type="text" 
-                placeholder="123456" 
-                className="w-full border-b-2 border-[#00a884] py-2 outline-none text-xl text-center tracking-widest"
-                value={otp}
-                onChange={(e) => setOtp(e.target.value)}
-                required
-              />
-            )}
-            <button 
-              type="submit"
-              className="w-full bg-[#00a884] text-white py-3 rounded-md font-medium hover:bg-[#008f6f] transition-colors"
-            >
-              {loginStep === 'phone' ? 'NEXT' : 'VERIFY'}
-            </button>
-          </form>
-          {loginStep === 'otp' && (
-            <button 
-              onClick={() => setLoginStep('phone')}
-              className="mt-4 text-[#00a884] text-sm font-medium"
-            >
-              Change Phone Number
-            </button>
-          )}
+          <button 
+            onClick={handleLogin}
+            className="w-full bg-[#00a884] text-white py-3 rounded-md font-medium hover:bg-[#008f6f] transition-colors flex items-center justify-center gap-3"
+          >
+            <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="Google" className="w-6 h-6" />
+            Sign in with Google
+          </button>
         </div>
       </div>
     );
@@ -506,16 +725,41 @@ export default function App() {
                     ) : remoteTyping === activeChat.participants[0].id ? (
                       <span className="text-[#00a884] font-medium">typing...</span>
                     ) : (
+                      activeChat.participants[0].privacy?.lastSeen === 'nobody' ? '' :
                       activeChat.participants[0].lastSeen ? `last seen ${formatDistanceToNow(new Date(activeChat.participants[0].lastSeen))} ago` : 'online'
                     )}
                   </div>
                 </div>
               </div>
               <div className="flex items-center gap-6 text-[#54656f] dark:text-[#aebac1]">
-                <Video className="w-5 h-5 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" />
-                <Phone className="w-5 h-5 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" />
+                {showChatSearch ? (
+                  <div className="flex items-center bg-white dark:bg-[#2a3942] rounded-lg px-3 py-1 animate-in slide-in-from-right-4">
+                    <Search className="w-4 h-4 text-[#8696a0] mr-2" />
+                    <input 
+                      type="text" 
+                      placeholder="Search messages..." 
+                      className="bg-transparent outline-none text-sm w-40 dark:text-[#e9edef]"
+                      value={chatSearchQuery}
+                      onChange={(e) => setChatSearchQuery(e.target.value)}
+                      autoFocus
+                    />
+                    <X className="w-4 h-4 cursor-pointer ml-2" onClick={() => { setShowChatSearch(false); setChatSearchQuery(''); }} />
+                  </div>
+                ) : (
+                  <Search 
+                    className="w-5 h-5 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" 
+                    onClick={() => setShowChatSearch(true)}
+                  />
+                )}
+                <Video 
+                  className="w-5 h-5 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" 
+                  onClick={() => initiateCall('video')}
+                />
+                <Phone 
+                  className="w-5 h-5 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" 
+                  onClick={() => initiateCall('voice')}
+                />
                 <div className="w-[1px] h-6 bg-[#d1d7db] dark:bg-[#2f3b43]" />
-                <Search className="w-5 h-5 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" />
                 <MoreVertical className="w-5 h-5 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" />
               </div>
             </div>
@@ -525,7 +769,7 @@ export default function App() {
               style={{ backgroundSize: '400px' }}
             >
               <AnimatePresence initial={false}>
-                {messages.map((msg) => {
+                {messages.filter(m => !chatSearchQuery || (m.text && m.text.toLowerCase().includes(chatSearchQuery.toLowerCase()))).map((msg) => {
                   const isMe = msg.senderId === currentUser?.id;
                   const senderName = users.find(u => u.id === msg.senderId)?.name;
                   return (
@@ -544,20 +788,65 @@ export default function App() {
                           ? "bg-[#d9fdd3] dark:bg-[#005c4b] rounded-tr-none" 
                           : "bg-white dark:bg-[#202c33] rounded-tl-none"
                       )}>
+                        {/* Reaction Trigger */}
+                        <div className="absolute -top-8 left-0 hidden group-hover:flex bg-white dark:bg-[#2a3942] shadow-lg rounded-full px-2 py-1 gap-1 z-20 border dark:border-[#2f3b43]">
+                          {['👍', '❤️', '😂', '😮', '😢', '🙏'].map(emoji => (
+                            <span 
+                              key={emoji} 
+                              className="cursor-pointer hover:scale-125 transition-transform p-1"
+                              onClick={() => socketRef.current?.emit('react-to-message', { messageId: msg.id, chatId: activeChat.id, userId: currentUser?.id, emoji })}
+                            >
+                              {emoji}
+                            </span>
+                          ))}
+                        </div>
+
                         {!isMe && activeChat.isGroup && (
                           <div className="text-[12px] font-medium text-[#00a884] mb-1">
                             {senderName}
                           </div>
                         )}
-                        <div className="text-[14.2px] text-[#111b21] dark:text-[#e9edef] pb-4 pr-4 whitespace-pre-wrap break-words leading-relaxed">
-                          {msg.text}
-                        </div>
+                        
+                        {msg.type === 'audio' ? (
+                          <div className="flex items-center gap-3 py-2 min-w-[200px]">
+                            <div className="w-10 h-10 rounded-full bg-[#00a884] flex items-center justify-center text-white cursor-pointer hover:bg-[#008f6f] transition-colors">
+                              <Play className="w-5 h-5 fill-current" onClick={() => {
+                                const audio = new Audio(msg.audioUrl);
+                                audio.play();
+                              }} />
+                            </div>
+                            <div className="flex-1 h-1 bg-gray-300 dark:bg-gray-600 rounded-full relative">
+                              <div className="absolute left-0 top-0 h-full bg-[#00a884] rounded-full w-1/3" />
+                            </div>
+                            <Volume2 className="w-4 h-4 text-gray-400" />
+                          </div>
+                        ) : (
+                          <div className="text-[14.2px] text-[#111b21] dark:text-[#e9edef] pb-4 pr-4 whitespace-pre-wrap break-words leading-relaxed">
+                            {msg.text}
+                          </div>
+                        )}
+
+                        {/* Reactions Display */}
+                        {msg.reactions && Object.keys(msg.reactions).length > 0 && (
+                          <div className="absolute -bottom-3 left-2 flex gap-1 bg-white dark:bg-[#2a3942] rounded-full px-1.5 py-0.5 shadow-sm border dark:border-[#2f3b43] z-10">
+                            {Object.entries(msg.reactions as { [emoji: string]: string[] }).map(([emoji, uids]) => (
+                              <span key={emoji} className="text-[10px] flex items-center gap-0.5">
+                                {emoji} <span className="text-[8px] text-[#667781] dark:text-[#8696a0]">{uids.length}</span>
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
                         <div className="absolute bottom-1 right-2 flex items-center gap-1">
                           <span className="text-[10px] text-[#667781] dark:text-[#8696a0] font-medium">
                             {format(new Date(msg.timestamp), 'HH:mm')}
                           </span>
                           {isMe && (
-                            <CheckCheck className="w-3.5 h-3.5 text-[#53bdeb]" />
+                            <span className="flex items-center">
+                              {msg.status === 'sent' && <Check className="w-3.5 h-3.5 text-[#8696a0]" />}
+                              {msg.status === 'delivered' && <CheckCheck className="w-3.5 h-3.5 text-[#8696a0]" />}
+                              {msg.status === 'read' && <CheckCheck className="w-3.5 h-3.5 text-[#53bdeb]" />}
+                            </span>
                           )}
                         </div>
                         <button 
@@ -580,28 +869,42 @@ export default function App() {
               onSubmit={handleSendMessage}
               className="px-4 py-2 bg-[#f0f2f5] dark:bg-[#202c33] flex items-center gap-4 min-h-[62px] border-l border-[#d1d7db] dark:border-[#2f3b43]"
             >
-              <div className="flex gap-4 text-[#54656f] dark:text-[#aebac1]">
-                <Smile className="w-6 h-6 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" />
-                <Paperclip className="w-6 h-6 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" />
-              </div>
-              <div className="flex-1">
-                <input 
-                  type="text" 
-                  placeholder="Type a message" 
-                  className="w-full bg-white dark:bg-[#2a3942] dark:text-[#e9edef] rounded-lg px-4 py-2.5 outline-none text-sm"
-                  value={inputText}
-                  onChange={handleTyping}
-                />
-              </div>
-              <div className="text-[#54656f] dark:text-[#aebac1]">
-                {inputText.trim() ? (
-                  <button type="submit">
-                    <Send className="w-6 h-6 cursor-pointer text-[#00a884]" />
-                  </button>
-                ) : (
-                  <Mic className="w-6 h-6 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" />
-                )}
-              </div>
+              {isRecording ? (
+                <div className="flex-1 flex items-center gap-4 bg-white dark:bg-[#2a3942] rounded-lg px-4 py-2">
+                  <div className="flex items-center gap-2 text-red-500 animate-pulse">
+                    <div className="w-2 h-2 bg-red-500 rounded-full" />
+                    <span className="text-sm font-medium">{Math.floor(recordingTime / 60)}:{String(recordingTime % 60).padStart(2, '0')}</span>
+                  </div>
+                  <div className="flex-1 text-sm text-[#667781] dark:text-[#8696a0]">Recording...</div>
+                  <MicOff className="w-6 h-6 text-red-500 cursor-pointer" onClick={cancelRecording} />
+                  <Send className="w-6 h-6 text-[#00a884] cursor-pointer" onClick={stopRecording} />
+                </div>
+              ) : (
+                <>
+                  <div className="flex gap-4 text-[#54656f] dark:text-[#aebac1]">
+                    <Smile className="w-6 h-6 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" />
+                    <Paperclip className="w-6 h-6 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" />
+                  </div>
+                  <div className="flex-1">
+                    <input 
+                      type="text" 
+                      placeholder="Type a message" 
+                      className="w-full bg-white dark:bg-[#2a3942] dark:text-[#e9edef] rounded-lg px-4 py-2.5 outline-none text-sm"
+                      value={inputText}
+                      onChange={handleTyping}
+                    />
+                  </div>
+                  <div className="text-[#54656f] dark:text-[#aebac1]">
+                    {inputText.trim() ? (
+                      <button type="submit">
+                        <Send className="w-6 h-6 cursor-pointer text-[#00a884]" />
+                      </button>
+                    ) : (
+                      <Mic className="w-6 h-6 cursor-pointer hover:text-[#111b21] dark:hover:text-white transition-colors" onClick={startRecording} />
+                    )}
+                  </div>
+                </>
+              )}
             </form>
           </>
         ) : (
@@ -672,8 +975,15 @@ export default function App() {
             <div className="flex-1 overflow-y-auto">
               {/* Avatar Section */}
               <div className="bg-white dark:bg-[#111b21] py-7 flex flex-col items-center mb-3 shadow-sm">
-                <div className="w-52 h-52 rounded-full overflow-hidden mb-5">
+                <div className="w-52 h-52 rounded-full overflow-hidden mb-5 relative group cursor-pointer">
                   <img src={showProfile.avatar} alt={showProfile.name} className="w-full h-full object-cover" loading="lazy" />
+                  {showProfile.id === currentUser?.id && (
+                    <label className="absolute inset-0 bg-black/40 flex flex-col items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer text-white text-xs text-center p-4">
+                      <Edit2 className="w-6 h-6 mb-2" />
+                      CHANGE PROFILE PHOTO
+                      <input type="file" className="hidden" accept="image/*" onChange={handleFileChange} />
+                    </label>
+                  )}
                 </div>
                 <div className="flex items-center gap-2">
                   <h3 className="text-2xl text-[#111b21] dark:text-[#e9edef]">{showProfile.name}</h3>
@@ -691,7 +1001,52 @@ export default function App() {
                 {showProfile.phoneNumber && (
                   <p className="text-[#667781] dark:text-[#8696a0] mt-1">{showProfile.phoneNumber}</p>
                 )}
+                {showProfile.id === currentUser?.id && (
+                  <button 
+                    onClick={handleLogout}
+                    className="mt-4 flex items-center gap-2 text-red-500 hover:text-red-600 font-medium text-sm"
+                  >
+                    <LogOut className="w-4 h-4" />
+                    LOGOUT
+                  </button>
+                )}
               </div>
+
+              {/* Privacy Settings Section */}
+              {showProfile.id === currentUser?.id && (
+                <div className="bg-white dark:bg-[#111b21] p-6 mb-3 shadow-sm">
+                  <div className="flex items-center gap-2 mb-4">
+                    <Settings className="w-5 h-5 text-[#008069] dark:text-[#00a884]" />
+                    <span className="text-sm text-[#008069] dark:text-[#00a884] font-medium">Privacy Settings</span>
+                  </div>
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs text-[#667781] dark:text-[#8696a0] block mb-1">Who can see my last seen</label>
+                      <select 
+                        className="w-full bg-transparent border-b dark:border-[#2f3b43] py-1 outline-none text-sm dark:text-[#e9edef]"
+                        value={currentUser?.privacy?.lastSeen || 'everyone'}
+                        onChange={(e) => updatePrivacySetting('lastSeen', e.target.value)}
+                      >
+                        <option value="everyone">Everyone</option>
+                        <option value="contacts">My Contacts</option>
+                        <option value="nobody">Nobody</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs text-[#667781] dark:text-[#8696a0] block mb-1">Who can see my status</label>
+                      <select 
+                        className="w-full bg-transparent border-b dark:border-[#2f3b43] py-1 outline-none text-sm dark:text-[#e9edef]"
+                        value={currentUser?.privacy?.status || 'everyone'}
+                        onChange={(e) => updatePrivacySetting('status', e.target.value)}
+                      >
+                        <option value="everyone">Everyone</option>
+                        <option value="contacts">My Contacts</option>
+                        <option value="nobody">Nobody</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Status Section */}
               <div className="bg-white dark:bg-[#111b21] p-6 mb-3 shadow-sm">
@@ -876,6 +1231,113 @@ export default function App() {
                 </button>
               </div>
             </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+      {/* Call Overlay */}
+      <AnimatePresence>
+        {activeCall && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.9 }}
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-[#0b141a]/90 backdrop-blur-sm p-4"
+          >
+            <div className="w-full max-w-sm bg-[#202c33] rounded-2xl shadow-2xl overflow-hidden flex flex-col items-center p-12 text-center">
+              <div className="w-32 h-32 rounded-full overflow-hidden mb-8 border-4 border-[#00a884]">
+                <img src={activeCall.user.avatar} alt={activeCall.user.name} className="w-full h-full object-cover" />
+              </div>
+              <h2 className="text-2xl font-medium text-white mb-2">{activeCall.user.name}</h2>
+              <p className="text-[#8696a0] mb-4 uppercase tracking-widest text-sm">
+                {activeCall.status === 'calling' ? 'Calling...' : 'Ongoing Call'}
+              </p>
+              
+              {activeCall.status === 'ongoing' && (
+                <div className="text-white font-mono text-xl mb-8">
+                  {Math.floor(callTimer / 60)}:{String(callTimer % 60).padStart(2, '0')}
+                </div>
+              )}
+              
+              <div className="flex gap-8">
+                <button 
+                  onClick={endCall}
+                  className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center text-white hover:bg-red-600 transition-colors shadow-lg"
+                >
+                  <Phone className="w-8 h-8 rotate-[135deg]" />
+                </button>
+                {activeCall.status === 'calling' && (
+                  <button 
+                    onClick={() => setActiveCall(prev => prev ? { ...prev, status: 'ongoing' } : null)}
+                    className="w-16 h-16 rounded-full bg-[#00a884] flex items-center justify-center text-white hover:bg-[#008f6f] transition-colors shadow-lg"
+                  >
+                    <Phone className="w-8 h-8" />
+                  </button>
+                )}
+              </div>
+              
+              <div className="mt-12 flex gap-6 text-[#aebac1]">
+                <button 
+                  onClick={() => setIsMuted(!isMuted)}
+                  className={cn("p-3 rounded-full transition-colors", isMuted ? "bg-red-500 text-white" : "hover:bg-white/10")}
+                >
+                  {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+                </button>
+                <button 
+                  onClick={() => setIsSpeakerOn(!isSpeakerOn)}
+                  className={cn("p-3 rounded-full transition-colors", isSpeakerOn ? "bg-[#00a884] text-white" : "hover:bg-white/10")}
+                >
+                  <Volume2 className="w-6 h-6" />
+                </button>
+                {activeCall.type === 'video' && <VideoOff className="w-6 h-6 cursor-pointer hover:text-white" />}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Image Cropper Modal */}
+      <AnimatePresence>
+        {imageToCrop && (
+          <div className="fixed inset-0 z-[200] bg-black flex flex-col">
+            <div className="flex items-center justify-between p-4 bg-[#202c33] text-white">
+              <div className="flex items-center gap-4">
+                <X className="w-6 h-6 cursor-pointer" onClick={() => setImageToCrop(null)} />
+                <span className="font-medium">Drag to adjust</span>
+              </div>
+              <button 
+                onClick={handleApplyCrop}
+                className="bg-[#00a884] px-6 py-2 rounded-md font-medium hover:bg-[#008f6f] transition-colors"
+              >
+                DONE
+              </button>
+            </div>
+            <div className="flex-1 relative bg-[#0b141a]">
+              <Cropper
+                image={imageToCrop}
+                crop={crop}
+                zoom={zoom}
+                aspect={1}
+                onCropChange={setCrop}
+                onCropComplete={onCropComplete}
+                onZoomChange={setZoom}
+                cropShape="round"
+                showGrid={false}
+              />
+            </div>
+            <div className="p-8 bg-[#202c33] flex items-center justify-center gap-6">
+              <Minus className="w-5 h-5 text-white cursor-pointer" onClick={() => setZoom(Math.max(1, zoom - 0.1))} />
+              <input
+                type="range"
+                value={zoom}
+                min={1}
+                max={3}
+                step={0.1}
+                aria-labelledby="Zoom"
+                onChange={(e) => setZoom(Number(e.target.value))}
+                className="w-64 h-1 bg-[#00a884] rounded-lg appearance-none cursor-pointer"
+              />
+              <Plus className="w-5 h-5 text-white cursor-pointer" onClick={() => setZoom(Math.min(3, zoom + 0.1))} />
+            </div>
           </div>
         )}
       </AnimatePresence>
